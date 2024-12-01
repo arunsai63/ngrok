@@ -10,12 +10,34 @@ const server = http.createServer(app)
 const wss = new WebSocket.Server({ server })
 
 const clients = new Map()
+const PORT = process.env.PORT || 8005
 
-PORT = process.env.PORT || 8005
+const validateSubdomain = (subdomain) => {
+    const pattern = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/
+    return pattern.test(subdomain)
+}
+const MAX_CONNECTIONS = 100
 
 wss.on('connection', (ws, req) => {
     const queryParams = new URL(req.url, 'http://localhost').searchParams
     let subdomain = queryParams.get('subdomain') || nanoid(8)
+
+    if (!validateSubdomain(subdomain)) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Invalid subdomain' }))
+        ws.close()
+        return
+    }
+
+    if (clients.has(subdomain)) {
+        ws.send(JSON.stringify({ type: 'error', message: `Subdomain ${subdomain} already in use` }))
+        ws.close()
+    }
+
+    if (clients.size >= MAX_CONNECTIONS) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Max connections reached' }))
+        ws.close()
+        return
+    }
 
     const clientData = {
         ws,
@@ -28,19 +50,41 @@ wss.on('connection', (ws, req) => {
     ws.on('message', message => {
         try {
             const response = JSON.parse(message)
-            // if (response.type === 'ping') {
-            //     clients.get(response.subdomain).lastSeen = Date.now()
-            //     return
-            // }
-            const { requestId } = response
+            const { requestId, type } = response
             const pendingRequest = clientData.pendingRequests.get(requestId)
 
-            if (pendingRequest) {
-                clearTimeout(pendingRequest.timeout)
-                const { headers, body, statusCode } = response
-                pendingRequest.res.writeHead(statusCode, headers)
-                pendingRequest.res.end(body)
-                clientData.pendingRequests.delete(requestId)
+            if (!pendingRequest) return
+
+            switch (type) {
+                case 'full':
+                    clearTimeout(pendingRequest.timeout)
+                    const { headers, statusCode, body } = response
+                    pendingRequest.res.writeHead(statusCode, headers)
+                    pendingRequest.res.end(Buffer.from(body, 'base64'))
+                    clientData.pendingRequests.delete(requestId)
+                    break
+
+                case 'data':
+                    if (!pendingRequest.chunks) pendingRequest.chunks = []
+                    pendingRequest.chunks[response.sequence] = Buffer.from(response.chunk, 'base64')
+                    break
+
+                case 'end':
+                    clearTimeout(pendingRequest.timeout)
+                    pendingRequest.res.writeHead(response.statusCode, response.headers)
+                    for (let i = 0; i < response.sequence; i++) {
+                        const chunk = pendingRequest.chunks[i]
+                        if (chunk) pendingRequest.res.write(chunk)
+                    }
+                    pendingRequest.res.end()
+                    clientData.pendingRequests.delete(requestId)
+                    break
+
+                case 'error':
+                    clearTimeout(pendingRequest.timeout)
+                    pendingRequest.res.status(response.statusCode).send(response.body)
+                    clientData.pendingRequests.delete(requestId)
+                    break
             }
         } catch (error) {
             console.error('Error processing response:', error)
@@ -50,7 +94,6 @@ wss.on('connection', (ws, req) => {
     ws.on('close', () => {
         const clientData = clients.get(subdomain)
         if (clientData) {
-            // Respond to all pending requests with an error
             clientData.pendingRequests.forEach(pending => {
                 pending.res.status(504).send('Tunnel disconnected')
             })
@@ -77,14 +120,12 @@ app.use((req, res) => {
     }
 
     const requestId = nanoid(8)
-    clientData.pendingRequests.set(requestId, { res })
-
     const timeout = setTimeout(() => {
         clientData.pendingRequests.delete(requestId)
         res.status(504).send('Gateway Timeout - No response received')
     }, 30000)
 
-    clientData.pendingRequests.set(requestId, { res, timeout })
+    clientData.pendingRequests.set(requestId, { res, timeout, chunks: [] })
 
     clientData.ws.send(JSON.stringify({
         type: 'request',
@@ -95,16 +136,6 @@ app.use((req, res) => {
         body: req.body
     }))
 })
-
-// Cleanup disconnected clients every hour
-// setInterval(() => {
-//     const now = Date.now()
-//     clients.forEach((clientData, subdomain) => {
-//         if ((now - clientData.lastSeen) > 60 * 60 * 1000) {
-//             clients.delete(subdomain)
-//         }
-//     })
-// }, 60 * 60 * 1000) // 1 hour
 
 server.listen(PORT, () => {
     console.log(`Tunnel server listening on port ${PORT}`)
