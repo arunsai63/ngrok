@@ -28,7 +28,7 @@ function parseArgs() {
 
 function createTunnel() {
     const { port, subdomain } = parseArgs()
-    const baseUrl = 'wss://connect.divinitydelights.com'
+    const baseUrl = 'wss://connect.example.com'
     const wsUrl = subdomain ? `${baseUrl}?subdomain=${subdomain}` : baseUrl
 
     const ws = new WebSocket(wsUrl)
@@ -42,7 +42,7 @@ function createTunnel() {
             const request = JSON.parse(message)
 
             if (request.type === 'connected') {
-                console.log(`Tunnel established at: https://${request.subdomain}.divinitydelights.com`)
+                console.log(`Tunnel established at: https://${request.subdomain}.example.com`)
                 return
             }
 
